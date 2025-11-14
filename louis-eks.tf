@@ -1,3 +1,4 @@
+# louis-eks.tf - Complete EKS Cluster in us-east-1
 terraform {
   required_version = ">= 1.0"
   
@@ -25,7 +26,7 @@ provider "aws" {
   }
 }
 
-# Create VPC for EKS
+# Create VPC for EKS Cluster
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.0"
@@ -41,12 +42,14 @@ module "vpc" {
   single_nat_gateway   = true
   enable_dns_hostnames = true
 
+  # Required for EKS
   public_subnet_tags = {
     "kubernetes.io/role/elb" = "1"
   }
 
   private_subnet_tags = {
     "kubernetes.io/role/internal-elb" = "1"
+    "kubernetes.io/cluster/louis"     = "owned"
   }
 
   tags = {
@@ -55,7 +58,12 @@ module "vpc" {
   }
 }
 
-# Create EKS cluster
+# Data source for EKS cluster authentication
+data "aws_eks_cluster_auth" "this" {
+  name = module.eks.cluster_name
+}
+
+# Create EKS Cluster
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 19.0"
@@ -79,11 +87,15 @@ module "eks" {
       max_size     = 3
       desired_size = 2
 
-      # Remote access (optional)
-      # remote_access = {
-      #   ec2_ssh_key = "your-key-name"
-      #   source_security_group_ids = [aws_security_group.remote_access.id]
-      # }
+      # Instance configuration
+      instance_requirements = {
+        cpu_manufacturers = ["amd", "intel"]
+      }
+
+      # Update configuration
+      update_config = {
+        max_unavailable_percentage = 33
+      }
 
       tags = {
         NodeGroup = "workers"
@@ -101,6 +113,15 @@ module "eks" {
       type                       = "ingress"
       source_node_security_group = true
     }
+    egress_all = {
+      description      = "Cluster all egress"
+      protocol         = "-1"
+      from_port        = 0
+      to_port          = 0
+      type             = "egress"
+      cidr_blocks      = ["0.0.0.0/0"]
+      ipv6_cidr_blocks = ["::/0"]
+    }
   }
 
   # Node security group additional rules
@@ -113,6 +134,14 @@ module "eks" {
       type        = "ingress"
       self        = true
     }
+    ingress_cluster_443 = {
+      description                   = "Cluster API to node groups"
+      protocol                      = "tcp"
+      from_port                     = 443
+      to_port                       = 443
+      type                          = "ingress"
+      source_cluster_security_group = true
+    }
     egress_all = {
       description      = "Node all egress"
       protocol         = "-1"
@@ -124,15 +153,17 @@ module "eks" {
     }
   }
 
+  # CloudWatch logging
+  cloudwatch_log_group_retention_in_days = 7
+  cluster_enabled_log_types              = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+
   tags = {
     Environment = "dev"
     Terraform   = "true"
+    Cluster     = "louis"
   }
-}
 
-# Data source for EKS cluster auth
-data "aws_eks_cluster_auth" "this" {
-  name = module.eks.cluster_name
+  depends_on = [module.vpc]
 }
 
 # Kubernetes provider configuration
@@ -140,15 +171,17 @@ provider "kubernetes" {
   host                   = module.eks.cluster_endpoint
   cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
   token                  = data.aws_eks_cluster_auth.this.token
-
-  # Only after cluster is created
-  depends_on = [module.eks]
 }
 
 # Outputs
+output "cluster_name" {
+  description = "EKS cluster name"
+  value       = module.eks.cluster_name
+}
+
 output "cluster_id" {
   description = "EKS cluster ID"
-  value       = module.eks.cluster_name
+  value       = module.eks.cluster_id
 }
 
 output "cluster_endpoint" {
@@ -157,12 +190,12 @@ output "cluster_endpoint" {
 }
 
 output "cluster_security_group_id" {
-  description = "Security group ids attached to the cluster control plane"
+  description = "Security group IDs attached to the cluster control plane"
   value       = module.eks.cluster_security_group_id
 }
 
 output "node_security_group_id" {
-  description = "Security group ids attached to the EKS node groups"
+  description = "Security group IDs attached to the EKS node groups"
   value       = module.eks.node_security_group_id
 }
 
@@ -176,12 +209,22 @@ output "private_subnets" {
   value       = module.vpc.private_subnets
 }
 
-output "kubectl_command" {
-  description = "kubectl config command"
-  value       = "aws eks update-kubeconfig --region us-east-1 --name ${module.eks.cluster_name}"
+output "public_subnets" {
+  description = "Public subnet IDs"
+  value       = module.vpc.public_subnets
 }
 
-output "test_nodes" {
-  description = "Command to test node connectivity"
-  value       = "kubectl get nodes"
+output "configure_kubectl" {
+  description = "Configure kubectl command"
+  value       = "aws eks update-kubeconfig --region us-east-1 --name ${module.eks.cluster_name} --alias ${module.eks.cluster_name}"
+}
+
+output "test_cluster" {
+  description = "Test cluster connection"
+  value       = "kubectl get nodes --context=${module.eks.cluster_name}"
+}
+
+output "cluster_arn" {
+  description = "EKS cluster ARN"
+  value       = module.eks.cluster_arn
 }
